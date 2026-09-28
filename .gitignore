@@ -1,0 +1,10 @@
+.gradle/
+.kotlin/
+build/
+local.properties
+keystore/
+*.apk
+.idea/
+tools/buds
+tools/sdp
+tools/sdp2
