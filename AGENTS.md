@@ -22,6 +22,7 @@ app/src/main/java/dev/pk/budspro/
   Prefs.kt                SharedPreferences as StateFlows (lockTouch defaults to true, guard, device address)
   MainActivity.kt, ui/MainScreen.kt   Compose Material 3 UI, single screen
 app/src/test/.../ProtocolTest.kt      Frame bytes captured from real earbuds; parser; real 0x61 payload
+.github/workflows/release.yml         CI: test, lint, build signed APK, publish to GitHub Releases
 tools/*.swift             macOS IOBluetooth tools used to reverse-engineer and verify the protocol
 ```
 
@@ -35,9 +36,40 @@ tools/*.swift             macOS IOBluetooth tools used to reverse-engineer and v
 - AGP 9.4.1 has **built-in Kotlin**. Do not add `org.jetbrains.kotlin.android`. Only the Compose compiler plugin
   (`org.jetbrains.kotlin.plugin.compose` 2.4.20) is applied.
 - `minSdk` is 33 on purpose (APIs like `getParcelableExtra(name, Class)`); the only target is Android 17.
-- Release signing uses `keystore/keystore.properties` plus `release.jks`. Both are git-ignored and must never be
-  committed. Updates over an installed build need the same key. Without the file, `assembleRelease` produces an
-  unsigned APK.
+- Local build:
+
+  ```sh
+  export JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home
+  export ANDROID_HOME=~/Library/Android/sdk
+  ./gradlew testDebugUnitTest assembleRelease
+  # -> app/build/outputs/apk/release/app-release.apk
+  ```
+
+- Release signing reads `keystore/keystore.properties` (paths are relative to `keystore/`):
+
+  ```properties
+  storeFile=release.jks
+  storePassword=...
+  keyAlias=budspro
+  keyPassword=...
+  ```
+
+  `keystore/` is git-ignored and must never be committed. Updates over an installed build need the same key, so never
+  regenerate it. Without the file, `assembleRelease` produces an unsigned APK; use `assembleDebug` for a debug-signed
+  build.
+
+### Release pipeline
+
+`.github/workflows/release.yml` builds, tests, lints and publishes a signed APK to GitHub Releases.
+
+- It runs on a pushed tag `v*`, or manually (`workflow_dispatch` with a `tag` input).
+- The tag must equal `v` + `versionName` from `app/build.gradle.kts`; otherwise the job fails. To release, bump
+  `versionCode` and `versionName`, commit, then `git tag vX.Y && git push origin vX.Y`.
+- The asset is named `BudsPro-<versionName>.apk`. The README links to `releases/latest`.
+- Repository secrets it needs, recreated from the owner's local `keystore/`:
+  - `KEYSTORE_BASE64` (`base64 -i keystore/release.jks`);
+  - `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`.
+- The job refuses to publish an unsigned APK when the secrets are missing.
 
 ### Emulator smoke test
 
@@ -56,9 +88,10 @@ There is no Bluetooth in the emulator, so it only checks UI, permissions, the se
 
 The earbuds must be connected to the Mac, not the phone.
 
-- Build the client: `swiftc -O -o tools/buds tools/buds.swift`.
+- Build the client: `swiftc -O -o tools/buds tools/buds.swift`. The binaries are git-ignored.
 - Run it: `./tools/buds <rfcommChannel=1> <listenSeconds> [hexId:hexPayload ...]`. It prints every TX/RX frame.
-  Examples: `./tools/buds 1 1 90:01`, `./tools/buds 1 1 28:`.
+  Examples: `./tools/buds 1 1 90:01` sends LOCK_TOUCHPAD 01; `./tools/buds 1 1 28:` sends an empty payload.
+- `tools/sdp.swift` and `tools/sdp2.swift` dump the earbuds' SDP records.
 - Ground truth for "did a tap reach the Mac as a media command" is the AVRCP log:
   `/usr/bin/log stream --predicate 'process == "bluetoothd" AND eventMessage CONTAINS "AVRCP"'`, then grep
   `Received AVRCP`. Use `/usr/bin/log`, because `log` is a zsh builtin.
@@ -69,10 +102,30 @@ The earbuds must be connected to the Mac, not the phone.
 
 ## Protocol facts (verified on firmware R190XXU0AVF1, extended-status revision 10)
 
+- Transport: SPP over RFCOMM, UUID `00001101-0000-1000-8000-00805F9B34FB`.
 - Frame layout: `FD | uint16 LE header | id | payload | CRC16-XMODEM LE over id+payload | DD`.
   - Header: low 10 bits are `len(payload)+3`; the upper bits are a sequence counter. Send 0 there and mask it on
     receive.
-  - The CRC is little-endian (checked against received frames).
+  - CRC16-XMODEM is poly `0x1021`, init `0`. It is little-endian on the wire (checked against received frames).
+  - Example: `fd 04 00 90 01 ca 08 dd` locks the touchpad.
+- Messages used by the app (→ phone to earbuds, ← earbuds to phone):
+
+  | ID | Dir | Meaning |
+  |---|---|---|
+  | 0x90 | → | Lock touchpad, 1 byte: `01` locked, `00` unlocked |
+  | 0x42 | ← | ACK: `[msgId, echoed payload…]` |
+  | 0x60 | ← | Status: `[rev, batL, batR, coupled, mainConn, placement L<<4\|R, caseBattery]` |
+  | 0x61 | ← | Extended status (offsets below) |
+  | 0x2D | ← | Touch event reached the earbuds |
+  | 0x91 | ← | TOUCH_UPDATED: `[locked]` |
+  | 0x77 / 0x78 | ← / → | Noise mode update / set (0 off, 1 ANC, 2 ambient) |
+  | 0x83 / 0x84 | → | ANC level (0 low, 1 high) / ambient level (0–3) |
+  | 0x85 / 0x86 | → | Game mode / EQ preset (0–5) |
+  | 0x7A / 0x7B | → | Voice detect on/off / timeout (0 = 5 s, 1 = 10 s, 2 = 15 s) |
+  | 0x92 | → | Touch-and-hold action `[left, right]`: 1 voice assistant, 2 noise control, 3 volume, 4 Spotify |
+  | 0x95 | → | Double tap on the earbud edge |
+  | 0xA0 / 0xA1 | → | Find my earbuds start / stop |
+  | 0x28 | → / ← | Build info |
 - **Lock: `0x90` with exactly one byte** (`01` locked / `00` unlocked). This matches the official plugin.
   GalaxyBudsClient's 5- and 7-byte "advanced touch lock" formats do **not** work on this firmware; this was disproved
   with AVRCP logs. Don't reintroduce them.
@@ -105,7 +158,7 @@ The earbuds must be connected to the Mac, not the phone.
   version would need the version-decoding logic from GalaxyBudsClient's `DebugGetAllData`/`0x26`, which is not
   implemented.
 - Reference sources used earlier:
-  - GalaxyBudsClient (`Message/Decoder/ExtendedStatusUpdateDecoder.cs`, enums, encoders).
+  - [GalaxyBudsClient](https://github.com/timschneeb/GalaxyBudsClient) (`Message/Decoder/ExtendedStatusUpdateDecoder.cs`, enums, encoders).
   - A jadx decompile of the official Galaxy Buds Pro Manager 6.0.26031351 (`com.samsung.accessory.atticmgr`, obtained
     through the Galaxy Store stub API). Its `v5/r.java` shows the 1-byte lock.
 
@@ -152,3 +205,4 @@ The earbuds must be connected to the Mac, not the phone.
   socket I/O goes on `Dispatchers.IO`.
 - Match the existing style: short KDoc on non-obvious classes, sparse comments that explain *why*.
 - Add a unit test with captured bytes whenever you touch framing or a parser.
+- `README.md` is for end users: features, install, usage. Keep build, protocol and design notes in this file.
